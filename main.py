@@ -13,7 +13,7 @@ from supabase import create_client, Client
 from dotenv import load_dotenv
 from datetime import datetime, timedelta, timezone
 import httpx
-
+import datetime
 # 1. Загрузка переменных окружения
 load_dotenv()
 
@@ -30,6 +30,8 @@ ACTORS = {
     "youtube": "streamers/youtube-scraper",
     "vk": "jupri/vkontakte",
 }
+
+system_logs = []
 
 # 2. Инициализация Supabase и FastAPI
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -268,6 +270,13 @@ def extract_video_id(url: str):
         
     return url # Если не узнали формат, возвращаем как есть
         
+def add_log(message: str):
+    now = datetime.datetime.now().strftime("%H:%M:%S")
+    log_entry = f"[{now}] {message}"
+    system_logs.append(log_entry)
+    # Храним только последние 30 записей, чтобы не забивать память
+    if len(system_logs) > 30:
+        system_logs.pop(0)
 
 # --- Эндпоинты ---
 
@@ -438,16 +447,20 @@ async def start_sync(user_data: dict = Depends(validate_telegram_data)):
             detail="У вас нет прав для запуска глобальной синхронизации"
         )
 
+    add_log("Запуск синхронизации...")
+
     # 2. Собираем ВСЕ ссылки за 7 дней (без привязки к команде)
     data_to_sync = get_all_recent_urls()
 
     if not data_to_sync:
+        add_log("⚠️ Ссылок для обновления не найдено")
         return {"status": "empty", "message": "Нет новых ссылок в базе за последние 7 дней"}
 
     # 3. Запуск акторов
     launch_details = {}
     
     for platform, urls in data_to_sync.items():
+        add_log(f"Запуск актора {platform} ({len(urls)} ссылок)")
         # Передаем "global", так как команды нам теперь не важны при запуске
         run_data = await call_apify_actor(platform, urls, "global")
         
@@ -457,7 +470,8 @@ async def start_sync(user_data: dict = Depends(validate_telegram_data)):
             launch_details[platform] = f"Started (RunID: {run_id})"
         else:
             launch_details[platform] = "Failed to start (Check logs)"
-
+    
+    add_log("✅ Все запросы в Apify отправлены")
     return {
         "status": "processing",
         "scope": "all_teams",
@@ -469,6 +483,7 @@ async def start_sync(user_data: dict = Depends(validate_telegram_data)):
 async def apify_webhook_handler(payload: dict = Body(...)):
     dataset_id = payload.get("resource_id")
     platform = payload.get("platform")
+    add_log(f"📥 Вебхук получен: {platform}")
 
     # 1. Получаем все недавние ссылки из нашей базы, чтобы знать, что мы вообще ищем
     # (Это даже лучше кеша в памяти, так как база всегда под рукой)
@@ -524,4 +539,9 @@ async def apify_webhook_handler(payload: dict = Body(...)):
             else:
                 print(f"⚠️ No match for: {vid_id}")
 
+    add_log(f"✨ Обновлено {platform}: {len(data)} объектов")
     return {"status": "success"}
+
+@app.get("/sync/logs")
+async def get_logs():
+    return {"logs": system_logs}

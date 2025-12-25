@@ -83,7 +83,7 @@ class ApifyTaskInfo(BaseModel):
 
 # --- Валидация Telegram ---
 
-"""def validate_telegram_data(authorization: str = Header(None)):
+def validate_telegram_data(authorization: str = Header(None)):
    
     if not authorization:
         raise HTTPException(status_code=401, detail="No Authorization header")
@@ -126,11 +126,11 @@ class ApifyTaskInfo(BaseModel):
     user_data_json = parsed_data.get('user', [None])[0]
     if user_data_json:
         return json.loads(user_data_json)
-    return {} """
+    return {} 
 
 # ВРЕМЕННАЯ ЗАГЛУШКА ДЛЯ ТЕСТОВ
-def validate_telegram_data(authorization: str = Header(None)):
-    return {"id": 1027611560, "username": "@zybastuk"}
+"""def validate_telegram_data(authorization: str = Header(None)):
+    return {"id": 1027611560, "username": "@zybastuk"}"""
 
 
 def get_all_recent_urls():

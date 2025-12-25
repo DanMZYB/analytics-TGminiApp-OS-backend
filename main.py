@@ -13,7 +13,7 @@ from supabase import create_client, Client
 from dotenv import load_dotenv
 from datetime import datetime, timedelta, timezone
 import httpx
-import datetime
+#test
 # 1. Загрузка переменных окружения
 load_dotenv()
 

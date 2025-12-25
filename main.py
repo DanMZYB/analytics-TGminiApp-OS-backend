@@ -271,7 +271,7 @@ def extract_video_id(url: str):
     return url # Если не узнали формат, возвращаем как есть
         
 def add_log(message: str):
-    now = datetime.datetime.now().strftime("%H:%M:%S")
+    now = datetime.now().strftime("%H:%M:%S")
     log_entry = f"[{now}] {message}"
     system_logs.append(log_entry)
     # Храним только последние 30 записей, чтобы не забивать память

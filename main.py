@@ -386,7 +386,7 @@ def register_new_user(
         for acc in payload.accounts:
             accounts_to_insert.append({
                 "user_id": payload.telegram_id,
-                "username_at": payload.username, # Безопасное получение
+                "username_at": payload.username, 
                 "account_name": acc.account_name,
                 "social_network": acc.social_network,
                 "team": admin_team

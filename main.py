@@ -3,12 +3,16 @@ import hmac
 import hashlib
 import json
 from urllib.parse import parse_qs, unquote
+import base64
+import re
 
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI, HTTPException, Header, Depends, Body
 from pydantic import BaseModel
 from supabase import create_client, Client
 from dotenv import load_dotenv
+from datetime import datetime, timedelta, timezone
+import httpx
 
 # 1. Загрузка переменных окружения
 load_dotenv()
@@ -16,6 +20,16 @@ load_dotenv()
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+APIFY_TOKEN = os.getenv("APIFY_TOKEN")
+BASE_URL = os.getenv("BASE_URL")
+ADMIN_ID = os.getenv("ADMIN_TELEGRAM_ID")
+
+ACTORS = {
+    "instagram": "apify/instagram-post-scraper",
+    "tiktok": "clockworks/free-tiktok-scraper",
+    "youtube": "streamers/youtube-scraper",
+    "vk": "jupri/vkontakte",
+}
 
 # 2. Инициализация Supabase и FastAPI
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -63,9 +77,13 @@ class UserUpdatePayload(BaseModel):
     new_name_soname: str = None
     new_accounts: list[AccountCreate] = [] # Модель AccountCreate мы создали ранее
 
+class ApifyTaskInfo(BaseModel):
+    urls: list[str]
+    platform: str
+
 # --- Валидация Telegram ---
 
-def validate_telegram_data(authorization: str = Header(None)):
+"""def validate_telegram_data(authorization: str = Header(None)):
    
     if not authorization:
         raise HTTPException(status_code=401, detail="No Authorization header")
@@ -108,11 +126,148 @@ def validate_telegram_data(authorization: str = Header(None)):
     user_data_json = parsed_data.get('user', [None])[0]
     if user_data_json:
         return json.loads(user_data_json)
-    return {} 
+    return {} """
 
 # ВРЕМЕННАЯ ЗАГЛУШКА ДЛЯ ТЕСТОВ
-"""def validate_telegram_data(authorization: str = Header(None)):
-    return {"id": 1027611560, "username": "@zybastuk"}"""
+def validate_telegram_data(authorization: str = Header(None)):
+    return {"id": 1027611560, "username": "@zybastuk"}
+
+
+def get_all_recent_urls():
+    seven_days_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    # Берем ВСЕ записи из таблицы analytics
+    response = supabase.table('analytics') \
+        .select("post_url") \
+        .gte('added_at', seven_days_ago) \
+        .execute()
+    
+    if not response.data: return {}
+
+    grouped = {"instagram": set(), "tiktok": set(), "youtube": set(), "vk": set()}
+    for record in response.data:
+        url = record['post_url']
+        low_url = url.lower()
+        if "instagram" in low_url: grouped["instagram"].add(url)
+        elif "tiktok" in low_url: grouped["tiktok"].add(url)
+        elif "youtube" in low_url or "youtu.be" in low_url: grouped["youtube"].add(url)
+        elif "vk.com" in low_url: grouped["vk"].add(url)
+    
+    return {k: list(v) for k, v in grouped.items() if v}
+
+async def call_apify_actor(platform: str, urls: list[str], team_name: str):
+    actor_id = ACTORS.get(platform)
+    if not actor_id:
+        return None
+
+    # Используем тильду для именных акторов
+    api_url = f"https://api.apify.com/v2/acts/{actor_id.replace('/', '~')}/runs"
+    
+    # Настройка вебхука
+    webhook_config = [{
+        "eventTypes": ["ACTOR_RUN.SUCCEEDED"],
+        "requestUrl": f"{BASE_URL}/webhooks/apify",
+        "payloadTemplate": json.dumps({
+            "platform": platform,
+            "team": team_name,
+            "resource_id": "{{resource.defaultDatasetId}}"
+        })
+    }]
+
+    # Формируем INPUT (оставляем как было)
+    if platform == "tiktok":
+        actor_input = {
+            "postURLs": urls,
+            "resultsPerPage": len(urls),
+            "shouldDownloadVideos": False,
+            "shouldDownloadCovers": False
+        }
+    elif platform == "instagram":
+        actor_input = {
+            "resultsLimit": len(urls),
+            "skipPinnedPosts": False,
+            "username": urls 
+        }
+    elif platform == "vk":
+        # ДЛЯ VK: Извлекаем ID из ссылок для поля query
+        vk_ids = []
+        for u in urls:
+            vid_id = extract_video_id(u)
+            if vid_id:
+                vk_ids.append(vid_id)
+
+        actor_input = {
+            "query": vk_ids,            # Отправляем массив ID типа ["1086143610_456239017"]
+            "search_mode": "video",
+            "limit": len(vk_ids),
+            "hd": False,
+            "is_online": False,
+            "with_photo": False,
+            "dev_dataset_clear": False,
+            "dev_no_strip": False
+        }
+    else:
+        actor_input = {
+            "startUrls": [{"url": u} for u in urls],
+            "maxResults": len(urls)
+        }
+
+    async with httpx.AsyncClient() as client:
+        try:
+            # Заголовки
+            headers = {
+                "Content-Type": "application/json",
+                # Передаем вебхуки через заголовок, предварительно превратив в Base64, 
+                # чтобы избежать проблем с кодировкой символов
+                "X-Apify-Webhooks": base64.b64encode(json.dumps(webhook_config).encode()).decode()
+            }
+            
+            # В параметрах оставляем ТОЛЬКО токен
+            params = {"token": APIFY_TOKEN}
+            
+            response = await client.post(
+                api_url, 
+                json=actor_input, 
+                params=params,
+                headers=headers,
+                timeout=30.0
+            )
+
+            if response.status_code not in [200, 201]:
+                print(f"--- APIFY ERROR --- {platform}")
+                print(f"Status: {response.status_code}, Body: {response.text}")
+                return {"error": response.status_code}
+
+            print(f"--- SUCCESS --- {platform} started!")
+            return response.json()
+            
+        except Exception as e:
+            print(f"--- CONNECTION ERROR --- {platform}: {str(e)}")
+            return {"error": "connection_failed"}
+        
+def extract_video_id(url: str):
+    if not url: return None
+    
+    # YouTube (v=ID или youtu.be/ID)
+    yt_match = re.search(r"(?:v=|\/|be\/)([0-9A-Za-z_-]{11})", url)
+    if "youtu" in url and yt_match:
+        return yt_match.group(1)
+    
+    # Instagram (p/ID или reel/ID)
+    ig_match = re.search(r"/(?:p|reel|tv)/([A-Za-z0-9_-]+)", url)
+    if "instagram" in url and ig_match:
+        return ig_match.group(1)
+    
+    # TikTok (video/ID или v/ID)
+    tt_match = re.search(r"video/(\d+)", url)
+    if "tiktok" in url and tt_match:
+        return tt_match.group(1)
+    
+    vk_match = re.search(r"(clip|video)(-?\d+_\d+)", url)
+    if "vk.com" in url and vk_match:
+        return vk_match.group(2)
+        
+    return url # Если не узнали формат, возвращаем как есть
+        
 
 # --- Эндпоинты ---
 
@@ -184,15 +339,12 @@ def add_analytics_batch(
 
 # --- Эндпоинт регистрации ---
 
+"""
 @app.post("/register_user")
 def register_new_user(
     payload: UserRegistration, 
     admin_data: dict = Depends(validate_telegram_data)
 ):
-    """
-    Регистрация пользователя админом. 
-    Автоматически присваивает команду админа и роль 'creator'.
-    """
     admin_tg_id = str(admin_data.get('id'))
 
     # 1. Проверяем, что вызывающий — админ
@@ -236,125 +388,7 @@ def register_new_user(
         "message": f"User {payload.username} registered in team {admin_team}"
     }
 
-@app.get("/admin/get_team_users")
-def get_team_users(admin_data: dict = Depends(validate_telegram_data)):
-    admin_tg_id = str(admin_data.get('id'))
-    
-    # 1. Получаем команду админа
-    admin_info = supabase.table('users').select("team, whois").eq('telegram_id', admin_tg_id).single().execute()
-    
-    if not admin_info.data or admin_info.data.get('whois') != 'admin':
-        raise HTTPException(status_code=403, detail="Only admins can register new users")
-    
-    team_name = admin_info.data.get('team')
-
-    # 2. Получаем всех юзеров этой команды
-    users_resp = supabase.table('users').select("*").eq('team', team_name).execute()
-    
-    # 3. Получаем все аккаунты этой команды для наглядности
-    accounts_resp = supabase.table('accounts').select("*").eq('team', team_name).execute()
-
-    # Группируем аккаунты по пользователям для удобства фронтенда
-    team_data = []
-    for user in users_resp.data:
-        user_id = user['telegram_id']
-        user_accounts = [acc for acc in accounts_resp.data if acc['user_id'] == user_id]
-        user['accounts'] = user_accounts
-        team_data.append(user)
-
-    return {"team": team_name, "members": team_data}
-
-@app.post("/admin/update_user")
-def update_user_data(
-    payload: UserUpdatePayload, 
-    admin_data: dict = Depends(validate_telegram_data)
-):
-    admin_tg_id = str(admin_data.get('id'))
-    
-    # 1. Проверка прав админа
-    admin_info = supabase.table('users').select("team, whois").eq('telegram_id', admin_tg_id).single().execute()
-    if not admin_info.data or admin_info.data.get('whois') != 'admin':
-        raise HTTPException(status_code=403, detail="Denied")
-    
-    admin_team = admin_info.data.get('team')
-
-    # 2. Получаем текущие данные целевого пользователя (имя и ник для username_at)
-    target_res = supabase.table('users').select("name_soname, username, team").eq('telegram_id', str(payload.target_telegram_id)).single().execute()
-    
-    if not target_res.data:
-        raise HTTPException(status_code=404, detail="User not found")
-    
-    # Проверка команды
-    if target_res.data.get('team') != admin_team:
-        raise HTTPException(status_code=403, detail="Target user is from another team")
-
-    current_username = target_res.data.get('username')
-
-    # 3. Обновляем имя, ТОЛЬКО если оно передано в запросе
-    if payload.new_name_soname is not None:
-        supabase.table('users').update({"name_soname": payload.new_name_soname})\
-            .eq('telegram_id', payload.target_telegram_id).execute()
-
-    # 4. Добавляем аккаунты, используя username из профиля пользователя
-    if payload.new_accounts:
-        added_accounts = []
-        for acc in payload.new_accounts:
-            added_accounts.append({
-                "user_id": payload.target_telegram_id,
-                "username_at": current_username, # Авто-подстановка ника из профиля
-                "account_name": acc.account_name,
-                "social_network": acc.social_network,
-                "team": admin_team
-            })
-        supabase.table('accounts').insert(added_accounts).execute()
-
-    return {"status": "success", "message": "Updated"}
-
-@app.get("/admin/team_activity")
-def get_team_activity(admin_data: dict = Depends(validate_telegram_data)):
-    admin_tg_id = str(admin_data.get('id'))
-    
-    # 1. Получаем команду админа
-    admin_info = supabase.table('users').select("team, whois").eq('telegram_id', admin_tg_id).single().execute()
-    
-    if not admin_info.data or admin_info.data.get('whois') != 'admin':
-        raise HTTPException(status_code=403, detail="Доступ только для админов")
-    
-    team_name = admin_info.data.get('team')
-
-    # 2. Получаем всех пользователей команды
-    users_resp = supabase.table('users').select("telegram_id, username, name_soname").eq('team', team_name).execute()
-    
-    activity_report = []
-
-    for user in users_resp.data:
-        user_id = user['telegram_id']
-        
-        # 3. Ищем последнюю запись в аналитике для этого пользователя
-        # Сортируем по 'added_at' (или как называется колонка времени в твоей таблице analytics)
-        # Если колонка называется иначе, замени 'added_at' на правильное имя (например, 'created_at')
-        last_entry = supabase.table('analytics')\
-            .select("added_at")\
-            .eq('user_id', user_id)\
-            .order("added_at", desc=True)\
-            .limit(1)\
-            .execute()
-
-        last_active = None
-        if last_entry.data:
-            last_active = last_entry.data[0]['added_at']
-
-        activity_report.append({
-            "telegram_id": user_id,
-            "username": user['username'],
-            "name_soname": user['name_soname'],
-            "last_activity": last_active  # Вернет дату или None, если записей нет
-        })
-
-    return {
-        "team": team_name,
-        "report": activity_report
-    }
+"""
 
 @app.get("/admin/get_full_team_data")
 def get_full_team_data(admin_data: dict = Depends(validate_telegram_data)):
@@ -374,8 +408,6 @@ def get_full_team_data(admin_data: dict = Depends(validate_telegram_data)):
     accounts = supabase.table('accounts').select("*").eq('team', team_name).execute().data
 
     # 4. Получаем самую свежую запись для каждого юзера из аналитики
-    # Используем PostgREST для получения последних записей (сортировка внутри группы сложна в простом SDK, 
-    # поэтому сделаем запрос последних действий для всей команды)
     activities = supabase.table('analytics').select("user_id, added_at").eq('team', team_name).order("added_at", desc=True).execute().data
 
     # 5. Собираем всё в один массив
@@ -396,3 +428,100 @@ def get_full_team_data(admin_data: dict = Depends(validate_telegram_data)):
         })
 
     return {"team": team_name, "members": full_data}
+
+@app.post("/sync/start")
+async def start_sync(user_data: dict = Depends(validate_telegram_data)):
+    # 1. Проверка прав (только твой ID из .env)
+    if str(user_data.get('id')) != str(ADMIN_ID):
+        raise HTTPException(
+            status_code=403, 
+            detail="У вас нет прав для запуска глобальной синхронизации"
+        )
+
+    # 2. Собираем ВСЕ ссылки за 7 дней (без привязки к команде)
+    data_to_sync = get_all_recent_urls()
+
+    if not data_to_sync:
+        return {"status": "empty", "message": "Нет новых ссылок в базе за последние 7 дней"}
+
+    # 3. Запуск акторов
+    launch_details = {}
+    
+    for platform, urls in data_to_sync.items():
+        # Передаем "global", так как команды нам теперь не важны при запуске
+        run_data = await call_apify_actor(platform, urls, "global")
+        
+        # Проверяем структуру ответа Apify (они возвращают данные в корне или в ключе 'data')
+        if run_data and ("id" in run_data or "data" in run_data):
+            run_id = run_data.get("id") or run_data.get("data", {}).get("id")
+            launch_details[platform] = f"Started (RunID: {run_id})"
+        else:
+            launch_details[platform] = "Failed to start (Check logs)"
+
+    return {
+        "status": "processing",
+        "scope": "all_teams",
+        "launched": launch_details,
+        "counts": {p: len(u) for p, u in data_to_sync.items()}
+    }
+
+@app.post("/webhooks/apify")
+async def apify_webhook_handler(payload: dict = Body(...)):
+    dataset_id = payload.get("resource_id")
+    platform = payload.get("platform")
+
+    # 1. Получаем все недавние ссылки из нашей базы, чтобы знать, что мы вообще ищем
+    # (Это даже лучше кеша в памяти, так как база всегда под рукой)
+    # Выбираем записи за последние 7 дней
+    db_records = supabase.table('analytics').select("id, post_url").execute()
+    
+    # Создаем карту { 'ID_ВИДЕО': 'ID_СТРОКИ_В_БАЗЕ' }
+    video_to_row_map = {
+        extract_video_id(r['post_url']): r['id'] 
+        for r in db_records.data if r['post_url']
+    }
+
+    items_url = f"https://api.apify.com/v2/datasets/{dataset_id}/items?token={APIFY_TOKEN}"
+    
+    async with httpx.AsyncClient() as client:
+        res = await client.get(items_url)
+        if res.status_code != 200: 
+            return {"status": "error"}
+        
+        data = res.json()
+        for item in data:
+            # Сбор ссылки
+            raw_url = item.get("url") or item.get("direct_url") or item.get("webVideoUrl") or item.get("inputUrl") or item.get("player")
+            vid_id = extract_video_id(raw_url)
+            
+            row_id = video_to_row_map.get(vid_id)
+
+            if row_id:
+                # ЛОГИКА LIKES
+                raw_likes = item.get("likes")
+                if isinstance(raw_likes, dict):
+                    likes = raw_likes.get("count", 0)
+                else:
+                    likes = item.get("likes")
+                    if likes is None: likes = item.get("likesCount")
+                    if likes is None: likes = item.get("diggCount")
+                    if likes is None: likes = 0
+
+                # ЛОГИКА VIEWS
+                views = item.get("views")
+                if views is None: views = item.get("videoPlayCount")
+                if views is None: views = item.get("viewCount")
+                if views is None: views = item.get("playCount")
+                if views is None: views = 0
+                
+                # Обновление в Supabase
+                supabase.table('analytics').update({
+                    "likes": likes,
+                    "views": views
+                }).eq('id', row_id).execute()
+                
+                print(f"✅ Updated {platform}: Row {row_id} (V: {views}, L: {likes})")
+            else:
+                print(f"⚠️ No match for: {vid_id}")
+
+    return {"status": "success"}

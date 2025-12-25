@@ -67,6 +67,7 @@ class AnalyticsBatch(BaseModel):
 class AccountCreate(BaseModel):
     account_name: str
     social_network: str
+    username_at: str = ""
 
 class UserRegistration(BaseModel):
     telegram_id: int
@@ -82,6 +83,7 @@ class UserUpdatePayload(BaseModel):
 class ApifyTaskInfo(BaseModel):
     urls: list[str]
     platform: str
+    
 
 # --- Валидация Telegram ---
 
@@ -348,7 +350,7 @@ def add_analytics_batch(
 
 # --- Эндпоинт регистрации ---
 
-"""
+
 @app.post("/register_user")
 def register_new_user(
     payload: UserRegistration, 
@@ -384,7 +386,7 @@ def register_new_user(
         for acc in payload.accounts:
             accounts_to_insert.append({
                 "user_id": payload.telegram_id,
-                "username_at": acc.username_at,
+                "username_at": payload.username, # Безопасное получение
                 "account_name": acc.account_name,
                 "social_network": acc.social_network,
                 "team": admin_team
@@ -396,8 +398,6 @@ def register_new_user(
         "status": "success", 
         "message": f"User {payload.username} registered in team {admin_team}"
     }
-
-"""
 
 @app.get("/admin/get_full_team_data")
 def get_full_team_data(admin_data: dict = Depends(validate_telegram_data)):
